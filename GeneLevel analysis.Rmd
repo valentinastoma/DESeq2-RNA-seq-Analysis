@@ -1,0 +1,280 @@
+---
+title: "DESeq2 RNA-seq workflow"
+author: "Valentina Stoma"
+date: "4/27/2020"
+output: md_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## RNA seq Workflow 
+
+In this notebook, I perform gene-level exploratory analysis and differential expression. 
+Data and workflow is provided by Michael I. Love1,2, Simon Anders3, Vladislav Kim4 and Wolfgang Huber. 
+
+
+Data for this gene-level expression analysis was prepared by Salmon - counts were quantified based on the index created by Salmon. Salmon tuorial can be found [here](https://combine-lab.github.io/salmon/getting_started/). 
+
+Relative abundance of all known and annotated transcripts is quantified without aligning reads - in this case, the counts are estimated. 
+
+[Here is the Salmon quantification workflow:](https://bioconductor.github.io/BiocWorkshops/rna-seq-data-analysis-with-deseq2.html#preparing-data-for-deseq2)
+
+
+1. Create Index:
+
+```{bash eval = FALSE, warning = FALSE, message = FALSE}
+salmon index -i gencode.v99_salmon_0.10.0 -t gencode.v99.transcripts.fa.gz
+```
+
+2. Quntify: 
+Loop over this command for multiple samples. 
+```{bash eval = FALSE}
+salmon quant -i gencode.v99_salmon_0.10.0 -p 6 --libType A \
+  --gcBias --biasSpeedSamp 5 \
+  -1 sample_01_1.fastq.gz -2 sample_01_2.fastq.gz \
+  -o sample_01
+```
+
+3. Import into R with *tximport*
+
+```{r }
+library(tximport)
+#BiocManager::install("tximportData")
+library(tximportData)
+```
+
+
+```{r}
+dir <- system.file("extdata", package="tximportData")
+list.files(dir)
+list.files(file.path(dir,"salmon"))
+```
+ 
+These identifiers are from European Nucleotide Archive. 
+Read in the samples 
+```{r}
+samples <- read.table(file.path(dir,"samples.txt"), header=TRUE)
+samples
+```
+```{r}
+files <- file.path(dir, "salmon", samples$run, "quant.sf.gz")
+names(files) <- paste0("sample",1:6)
+all(file.exists(files))
+```
+
+4. Mapping transcripts to genes:
+We therefore will construct a data.frame called tx2gene with two columns: 1) transcript ID and 2) gene ID. The column names do not matter but this column order must be used. The transcript ID must be the same one used in the abundance files. This can most easily be accomplished by downloading the GTF file at the same time that the transcriptome FASTA is downloaded, and generating tx2gene from the GTF file using Bioconductor’s TxDb infrastructure.
+
+```{r}
+#BiocManager::install("TxDb.Hsapiens.UCSC.hg38.knownGene")
+library("TxDb.Hsapiens.UCSC.hg38.knownGene")
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+k <- keys(txdb, keytype="TXNAME")
+tx2gene <- select(txdb, k, "GENEID", "TXNAME")
+```
+
+```{r}
+library(readr)
+tx2gene <- read_csv(file.path(dir, "tx2gene.gencode.v27.csv"))
+head(tx2gene)
+```
+
+"Finally the following line of code imports Salmon transcript quantifications into R, collapsing to the gene level using the information in tx2gene"
+```{r}
+library(tximport)
+library(jsonlite)
+library(readr)
+txi<- tximport(files, type = 'salmon', tx2gene = tx2gene)
+```
+The txi object is simply a list of matrices (and one character vector):
+```{r}
+names(txi)
+
+txi$counts[1:3, 1:3]
+
+txi$length[1:3, 1:3]
+txi$abundance[1:3, 1:3]
+txi$countsFromAbundance
+```
+
+
+5. Create a DESeq object 
+
+```{r}
+#BiocManager::install("DESeq2")
+library(DESeq2)
+dds <- DESeqDataSetFromTximport(txi, samples, ~1)
+
+dds$center
+dds$pop
+```
+
+## Exploratory data analysis: 
+
+```{r}
+library(airway)
+data("airway")
+```
+
+```{r}
+airway$index<- relevel(airway$dex, "untrt")
+airway$dex
+```
+
+We can quickly check the millions of fragments that uniquely aligned to the genes (the second argument of round tells how many decimal points to keep)
+
+```{r}
+round( colSums(assay(airway)) / 1e6, 1 )
+```
+
+```{r}
+colData(airway)
+```
+
+```{r}
+table(airway$cell)
+```
+```{r}
+table(airway$dex)
+```
+Create a DESeqDataSet, where we control for the cell line, while testing for differences accross dexamethasone treatment:
+
+```{r}
+dds <- DESeqDataSet(airway, design = ~ cell + dex)
+```
+
+Minimal filtering to reduce hte size of the dataset:
+```{r}
+keep<- rowSums(counts(dds) >= 5) >= 4
+table(keep)
+dds<- dds[keep, ]
+```
+
+Exploratory analysis of the counts for each sample:
+```{r}
+boxplot(log10(counts(dds)+1))
+```
+"The main function in DESeq2 involves computation of size factors which normalize for differences in sequencing depth among samples. We can also compute these size factors manually, so that the normalized counts are available for plotting:"
+```{r}
+dds <- estimateSizeFactors(dds)
+boxplot(log10(counts(dds,normalized=TRUE)+1))
+```
+
+##  Normalization:
+
+Taking the logarithm of counts plus a pseudocount of 1 is a common transformation, but it tends to __inflate the sampling variance of low counts__ such that it is even larger than biological variation across groups of samples. In DESeq2 we therefore provide transformations which produce __log-scale data such that the systematic trends have been removed__. Our recommended transformation is the __variance-stabilizing transformation__, or VST, and it can be called with the vst function
+```{r variance stabilization}
+vsd <- vst(dds)
+class(vsd)
+```
+The return of this function is continuous values - these values can be accessed with the assay: 
+```{r}
+assay(vsd)[1:3, 1:3]
+```
+
+## Principle component analysis: 
+
+Now that the data is normalized, we can perform the PCA. 
+
+```{r PCA }
+plotPCA(vsd, 'dex')
+```
+
+```{r}
+library("ggplot2")
+pcaData <- plotPCA(vsd, intgroup = c( "dex", "cell"), returnData = TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+ggplot(pcaData, aes(x = PC1, y = PC2, color = dex, shape = cell)) +
+  geom_point(size =3) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  coord_fixed()
+```
+
+##  Differential Expressoin Steps:
+
+```{r diff expression}
+dds<- DESeq(dds)
+res<- results(dds)
+```
+
+The results table res contains the results for each gene (in the same order as in the DESeqDataSet). If we want to see the top genes, we can order it like so:
+```{r}
+head(res[order(res$pvalue), ])
+```
+PLotting counts for the top genes:
+```{r}
+plotCounts(dds, which.min(res$pvalue), "dex")
+```
+We can examine all the log2 fold changes (LFC) due to dexamethasone treatment over the mean of counts using plotMA:
+
+```{r}
+plotMA(res, ylim = c(-5,5))
+```
+
+Apply LFC shrinkage 
+```{r}
+#BiocManager::install("apeglm")
+library(apeglm)
+resultsNames(dds)
+res2 <- lfcShrink(dds, coef="dex_untrt_vs_trt", type="apeglm")
+```
+
+```{r lcf shrinkage}
+par(mfrow=c(1,2))
+plotMA(res, ylim=c(-3,3), main="No shrinkage")
+plotMA(res2, ylim=c(-3,3), main="apeglm")
+```
+
+## Minimum effect size:
+
+Set up a minimum biologically meaningful effect size and test against it. 
+
+```{r}
+res.lfc <- results(dds, lfcThreshold=1)
+names(res.lfc)
+res.lfc2 <- lfcShrink(dds, coef="dex_untrt_vs_trt", type="apeglm",
+                      lfcThreshold=1)
+```
+Note that testing against an LFC threshold is not equivalent to testing against a null hypothesis of 0 and then filtering on LFC values. 
+
+```{r}
+par(mfrow=c(1,2))
+plotMA(res.lfc, ylim=c(-5,5), main="No shrinkage, LFC test")
+plotMA(res.lfc2, ylim=c(-5,5), main="apeglm, LFC test", alpha=0.01)
+```
+
+## Annotation Hub: 
+
+```{r message=FALSE}
+library(AnnotationHub)
+ah <<- AnnotationHub()
+```
+```{r}
+query(ah, c("OrgDb","Homo sapiens"))
+```
+
+
+## Building Reports 
+
+```{r}
+#BiocManager::install("ReportingTools")
+library(ReportingTools)
+```
+
+```{r}
+tmp <- tempdir() # you would instead use a meaningful path here
+rep <- HTMLReport(shortName="airway", title="Airway DGE",
+                  basePath=tmp, reportDirectory="report")
+publish(res, rep, dds, n=20, make.plots=TRUE, factor=dds$dex)
+finish(rep)
+```
+
+```{r}
+browseURL(file.path(tmp,"report","airway.html"))
+```
+
+
+
